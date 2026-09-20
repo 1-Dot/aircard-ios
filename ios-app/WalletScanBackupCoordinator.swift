@@ -1,8 +1,8 @@
 import SwiftUI
 
 /// Coordinates the first-scan immutable backup without changing the preview reader's
-/// move-and-write-back transaction. The preview/identity scan completes first; only
-/// then is the exact raw artwork set preserved and restored.
+/// move-and-write-back transaction. The preview/identity scan is allowed to complete
+/// first, but a missing preview must never prevent preservation of the raw artwork.
 struct WalletScanBackupRootView: View {
     @EnvironmentObject var vm: AppViewModel
     @ObservedObject private var operationStore = WalletCardOperationStore.shared
@@ -11,17 +11,39 @@ struct WalletScanBackupRootView: View {
     var body: some View {
         AirCardFeatureRootView()
             .onChange(of: operationStore.phases) { _, phases in
-                guard vm.isScanningCards else { return }
-
                 for (cardId, phase) in phases {
-                    guard case .ready(let label) = phase,
-                          label.contains("Artwork loaded"),
+                    let previewAttemptFinished: Bool
+
+                    switch phase {
+                    case .ready(let label):
+                        previewAttemptFinished = label.contains("Artwork loaded")
+                    case .failed(let label):
+                        previewAttemptFinished = label.contains("Wallet preview unavailable")
+                    default:
+                        previewAttemptFinished = false
+                    }
+
+                    guard previewAttemptFinished,
                           !backupStartedForCards.contains(cardId) else {
                         continue
                     }
 
-                    backupStartedForCards.insert(cardId)
-                    vm.preserveFirstDetectedArtworkAfterScan(for: cardId)
+                    let cleanId = CardItem.cleanCardId(cardId) ?? cardId
+
+                    // If the preview reader retained a recovery copy, do not start a
+                    // second move-based transaction until the first one is repaired.
+                    // A normal "preview unavailable" result with no pending recovery
+                    // still proceeds to immutable backup creation.
+                    guard AppViewModel.walletRecoveryItems(for: cleanId).isEmpty else {
+                        WalletCardOperationStore.shared.set(
+                            .failed("Preview recovery required before original backup"),
+                            for: cleanId
+                        )
+                        continue
+                    }
+
+                    backupStartedForCards.insert(cleanId)
+                    vm.preserveFirstDetectedArtworkAfterScan(for: cleanId)
                 }
             }
             .onChange(of: vm.cards.map(\.id)) { _, ids in
@@ -32,10 +54,12 @@ struct WalletScanBackupRootView: View {
 }
 
 extension AppViewModel {
-    /// Creates the authoritative immutable backup immediately after the first successful
-    /// scan/preview transaction. `ensureOriginalArtworkBackup` is move-based, so when it
-    /// creates a new backup this method writes the exact raw files straight back to Wallet
-    /// before declaring the scan complete.
+    /// Creates the authoritative immutable backup after the first completed preview
+    /// attempt. Preview success is optional: if no displayable preview is available,
+    /// AirCard still preserves the raw artwork as long as no scan recovery is pending.
+    /// `ensureOriginalArtworkBackup` is move-based, so when it creates a new backup this
+    /// method writes the exact raw files straight back to Wallet before declaring the
+    /// scan complete.
     func preserveFirstDetectedArtworkAfterScan(for cardId: String) {
         let cleanId = CardItem.cleanCardId(cardId) ?? cardId
 
