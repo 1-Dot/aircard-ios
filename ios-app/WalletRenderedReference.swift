@@ -41,6 +41,7 @@ private struct WalletRenderedCacheReadResult: Sendable {
 
 /// Local decode target for Wallet's archived PKImage object. We intentionally decode
 /// only imageData and do not instantiate any PassKit-private runtime class.
+@objc(AirCardArchivedPKImage)
 private final class AirCardArchivedPKImage: NSObject, NSCoding {
     let imageData: Data?
 
@@ -54,6 +55,7 @@ private final class AirCardArchivedPKImage: NSObject, NSCoding {
 
 /// Local decode target for the archived FrontFace image set. Only faceImage is needed;
 /// other archived layers are ignored so their private classes never have to load.
+@objc(AirCardArchivedFrontFaceImageSet)
 private final class AirCardArchivedFrontFaceImageSet: NSObject, NSCoding {
     let faceImage: AirCardArchivedPKImage?
 
