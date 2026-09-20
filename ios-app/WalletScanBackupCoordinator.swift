@@ -1,8 +1,7 @@
 import SwiftUI
 
-/// Coordinates the first-scan immutable backup without changing the preview reader's
-/// move-and-write-back transaction. The preview/identity scan is allowed to complete
-/// first, but a missing preview must never prevent preservation of the raw artwork.
+/// Coordinates first-scan rendered-face capture and immutable original-artwork backup
+/// without changing the move-and-write-back transaction used by the scan reader.
 struct WalletScanBackupRootView: View {
     @EnvironmentObject var vm: AppViewModel
     @ObservedObject private var operationStore = WalletCardOperationStore.shared
@@ -23,17 +22,19 @@ struct WalletScanBackupRootView: View {
                         previewAttemptFinished = false
                     }
 
-                    guard previewAttemptFinished,
-                          !backupStartedForCards.contains(cardId) else {
+                    guard previewAttemptFinished else { continue }
+                    let cleanId = CardItem.cleanCardId(cardId) ?? cardId
+
+                    // A later manual Refresh Wallet Preview should refresh the canonical
+                    // rendered FrontFace too, but it must never replace/recreate the
+                    // immutable Originals backup in the same app session.
+                    if backupStartedForCards.contains(cleanId) {
+                        vm.refreshRenderedReferenceAfterPreview(for: cleanId)
                         continue
                     }
 
-                    let cleanId = CardItem.cleanCardId(cardId) ?? cardId
-
                     // If the preview reader retained a recovery copy, do not start a
                     // second move-based transaction until the first one is repaired.
-                    // A normal "preview unavailable" result with no pending recovery
-                    // still proceeds to immutable backup creation.
                     guard AppViewModel.walletRecoveryItems(for: cleanId).isEmpty else {
                         WalletCardOperationStore.shared.set(
                             .failed("Preview recovery required before original backup"),
@@ -54,14 +55,14 @@ struct WalletScanBackupRootView: View {
 }
 
 extension AppViewModel {
-    /// Captures a best-effort Wallet-rendered reference and then creates/verifies the
+    /// Captures Wallet's canonical FrontFace.faceImage and then creates/verifies the
     /// authoritative immutable raw-artwork backup. The two stores have different jobs:
     ///
-    /// - RenderedReferences = what Wallet appears to render, when a decodable cache
-    ///   entry is available. This is display/reproduction evidence only.
-    /// - Originals = exact provider files used by Restore Original.
+    /// - RenderedReferences = the final composite Wallet face used for faithful preview.
+    /// - Originals = exact provider files used only by Restore Original.
     ///
-    /// Failure or absence of a rendered reference never prevents the raw backup.
+    /// Absence of FrontFace never prevents raw backup creation. A move/write-back safety
+    /// failure is logged and retained for diagnostics, while raw backup still proceeds.
     func preserveFirstDetectedArtworkAfterScan(for cardId: String) {
         let cleanId = CardItem.cleanCardId(cardId) ?? cardId
 
@@ -71,8 +72,8 @@ extension AppViewModel {
         }
 
         let pairingPath = PairingController.pairingFilePath()
-        WalletCardOperationStore.shared.set(.backingUp("Checking Wallet-rendered face…"), for: cleanId)
-        scanStatusText = "Found card: \(cleanId.prefix(12))… Checking rendered Wallet face…"
+        WalletCardOperationStore.shared.set(.backingUp("Reading exact Wallet FrontFace…"), for: cleanId)
+        scanStatusText = "Found card: \(cleanId.prefix(12))… Reading Wallet FrontFace…"
 
         Task.detached(priority: .userInitiated) { [weak self] in
             let rendered = await Self.captureRenderedWalletReference(
@@ -85,37 +86,35 @@ extension AppViewModel {
                 switch rendered {
                 case .captured(let manifest):
                     self.log.append(
-                        "🎨 Wallet-rendered reference captured for \(cleanId.prefix(12))… " +
+                        "🎨 Exact Wallet FrontFace captured for \(cleanId.prefix(12))… " +
                         "from \(manifest.cacheSuffix)/\(manifest.leaf) " +
                         "(\(manifest.pixelWidth)×\(manifest.pixelHeight), \(manifest.byteCount) bytes)"
                     )
                     WalletCardOperationStore.shared.set(
-                        .backingUp("Rendered face captured · preserving original…"),
+                        .backingUp("Exact Wallet face captured · preserving original…"),
                         for: cleanId
                     )
                 case .unavailable(let attempted, let detail):
-                    var line = "ℹ️ No directly decodable Wallet-rendered reference found for \(cleanId.prefix(12))… after \(attempted) cache candidates"
+                    var line = "ℹ️ No decodable Wallet FrontFace.faceImage found for \(cleanId.prefix(12))… after \(attempted) FrontFace candidates"
                     if let detail { line += ": \(detail)" }
                     self.log.append(line)
                     WalletCardOperationStore.shared.set(
-                        .backingUp("Rendered face unavailable · preserving original…"),
+                        .backingUp("Wallet FrontFace unavailable · preserving original…"),
                         for: cleanId
                     )
                 case .unsafe(let error):
                     self.log.append(
-                        "⚠️ Wallet-rendered reference probe stopped: \(error). " +
+                        "⚠️ Wallet FrontFace probe stopped: \(error). " +
                         "Immutable raw backup will continue."
                     )
                     WalletCardOperationStore.shared.set(
-                        .backingUp("Rendered probe stopped · preserving original…"),
+                        .backingUp("FrontFace probe stopped · preserving original…"),
                         for: cleanId
                     )
                 }
                 self.objectWillChange.send()
             }
 
-            // The rendered-reference probe is deliberately non-authoritative. Always
-            // continue into raw backup validation/creation regardless of its result.
             let existing = Self.validateOriginalArtworkBackup(for: cleanId)
             if existing.isValid {
                 await MainActor.run {
@@ -211,6 +210,44 @@ extension AppViewModel {
                 WalletCardOperationStore.shared.set(.ready("Artwork + original backup saved ✅"), for: cleanId)
                 self.scanStatusText = "Found card: \(cleanId.prefix(12))… Original artwork saved ✅"
                 self.log.append("✅ First-detected Wallet artwork preserved and verified for \(cleanId.prefix(12))…")
+                self.objectWillChange.send()
+            }
+        }
+    }
+
+    /// Refreshes only the canonical Wallet-rendered face after the user requests a
+    /// preview refresh. The immutable original-artwork backup is deliberately untouched.
+    func refreshRenderedReferenceAfterPreview(for cardId: String) {
+        let cleanId = CardItem.cleanCardId(cardId) ?? cardId
+        guard hasPairingFile else { return }
+        let pairingPath = PairingController.pairingFilePath()
+
+        WalletCardOperationStore.shared.set(.scanning("Refreshing exact Wallet face…"), for: cleanId)
+
+        Task.detached(priority: .userInitiated) { [weak self] in
+            let rendered = await Self.captureRenderedWalletReference(
+                cardId: cleanId,
+                pairingPath: pairingPath
+            )
+
+            await MainActor.run {
+                guard let self else { return }
+                switch rendered {
+                case .captured(let manifest):
+                    self.log.append(
+                        "🎨 Wallet FrontFace refreshed for \(cleanId.prefix(12))… " +
+                        "(\(manifest.pixelWidth)×\(manifest.pixelHeight), \(manifest.byteCount) bytes)"
+                    )
+                    WalletCardOperationStore.shared.set(.ready("Exact Wallet face refreshed ✅"), for: cleanId)
+                case .unavailable(_, let detail):
+                    var line = "ℹ️ Wallet FrontFace refresh found no decodable faceImage for \(cleanId.prefix(12))…"
+                    if let detail { line += ": \(detail)" }
+                    self.log.append(line)
+                    WalletCardOperationStore.shared.set(.ready("Wallet preview refreshed · exact face unavailable"), for: cleanId)
+                case .unsafe(let error):
+                    self.log.append("⚠️ Wallet FrontFace refresh stopped: \(error)")
+                    WalletCardOperationStore.shared.set(.failed("Wallet face refresh needs recovery"), for: cleanId)
+                }
                 self.objectWillChange.send()
             }
         }

@@ -3,10 +3,10 @@ import UIKit
 import CryptoKit
 import AirliftFFI
 
-/// Describes the Wallet-rendered reference captured from the per-card cache.
+/// Describes the canonical Wallet-rendered face captured from the per-card cache.
 /// This is deliberately separate from the immutable provider-file backup used by
-/// Restore Original. A rendered reference may be useful for reproducing the exact
-/// face Wallet shows, but it must never replace the raw restore backup.
+/// Restore Original. The rendered face is for faithful preview/reproduction; the
+/// raw provider files remain the only authoritative restore source.
 struct WalletRenderedReferenceManifest: Codable, Equatable, Sendable {
     let version: Int
     let cardId: String
@@ -17,6 +17,9 @@ struct WalletRenderedReferenceManifest: Codable, Equatable, Sendable {
     let sha256: String
     let pixelWidth: Int
     let pixelHeight: Int
+    let extractionPath: String?
+    let containerByteCount: Int?
+    let containerSha256: String?
 }
 
 enum WalletRenderedReferenceCaptureResult: Sendable {
@@ -36,17 +39,38 @@ private struct WalletRenderedCacheReadResult: Sendable {
     let error: String?
 }
 
+/// Local decode target for Wallet's archived PKImage object. We intentionally decode
+/// only imageData and do not instantiate any PassKit-private runtime class.
+private final class AirCardArchivedPKImage: NSObject, NSCoding {
+    let imageData: Data?
+
+    required init?(coder: NSCoder) {
+        imageData = coder.decodeObject(forKey: "imageData") as? Data
+        super.init()
+    }
+
+    func encode(with coder: NSCoder) { }
+}
+
+/// Local decode target for the archived FrontFace image set. Only faceImage is needed;
+/// other archived layers are ignored so their private classes never have to load.
+private final class AirCardArchivedFrontFaceImageSet: NSObject, NSCoding {
+    let faceImage: AirCardArchivedPKImage?
+
+    required init?(coder: NSCoder) {
+        faceImage = coder.decodeObject(forKey: "faceImage") as? AirCardArchivedPKImage
+        super.init()
+    }
+
+    func encode(with coder: NSCoder) { }
+}
+
 extension AppViewModel {
-    /// Wallet cache entries observed/used by the existing cache invalidation path.
-    /// FrontFace is intentionally preferred because it is the best candidate for the
-    /// final face Wallet actually renders. Preview and PlaceHolder are fallbacks only.
+    /// The final composite is FrontFace. Preview is an icon-oriented cache and
+    /// PlaceHolder is only a partial strip, so neither is accepted as a full card face.
     private nonisolated static let renderedWalletCacheCandidates: [WalletRenderedCacheCandidate] = [
         .init(suffix: ".pkcache", leaf: "FrontFace"),
-        .init(suffix: ".cache", leaf: "FrontFace"),
-        .init(suffix: ".pkcache", leaf: "Preview"),
-        .init(suffix: ".cache", leaf: "Preview"),
-        .init(suffix: ".pkcache", leaf: "PlaceHolder"),
-        .init(suffix: ".cache", leaf: "PlaceHolder")
+        .init(suffix: ".cache", leaf: "FrontFace")
     ]
 
     nonisolated static func renderedWalletReferenceDirectory(for cardId: String) -> URL {
@@ -68,9 +92,21 @@ extension AppViewModel {
     }
 
     nonisolated static func renderedWalletReferenceImage(for cardId: String) -> UIImage? {
-        let url = renderedWalletReferenceImagePath(for: cardId)
+        let cleanId = CardItem.cleanCardId(cardId) ?? cardId
+        let url = renderedWalletReferenceImagePath(for: cleanId)
         guard let data = try? Data(contentsOf: url) else { return nil }
-        return ImageEngine.safeImageFromData(data, maxDimension: 2048)
+
+        // Version 2+ manifests describe the exact persisted face image. Verify it before
+        // display so a partial/corrupt cache capture cannot silently become the preview.
+        if let manifest = renderedWalletReferenceManifest(for: cleanId), manifest.version >= 2 {
+            guard manifest.cardId == cleanId,
+                  manifest.byteCount == data.count,
+                  manifest.sha256 == renderedReferenceSHA256(data) else {
+                return nil
+            }
+        }
+
+        return ImageEngine.safeImageFromData(data, maxDimension: 4096)
     }
 
     nonisolated static func renderedWalletReferenceManifest(for cardId: String) -> WalletRenderedReferenceManifest? {
@@ -79,9 +115,43 @@ extension AppViewModel {
         return try? JSONDecoder().decode(WalletRenderedReferenceManifest.self, from: data)
     }
 
-    /// Best-effort probe of Wallet's rendered per-card cache. Failure or absence is
-    /// non-fatal and must never block creation of the immutable raw artwork backup.
-    /// Every successful move-based read is written back before the bytes are inspected.
+    /// Extracts exactly FrontFace.faceImage.imageData from Wallet's NSKeyedArchiver
+    /// payload. Wallet wraps the keyed archive in a small binary cache envelope, so we
+    /// locate the bplist payload first. Public NSKeyedUnarchiver class substitution lets
+    /// us decode the two fields we need without linking or instantiating private classes.
+    ///
+    /// Internal visibility is intentional so the test target can validate the decoder
+    /// with a synthetic archive that uses the observed Wallet class names.
+    nonisolated static func decodeRenderedWalletFrontFaceImageData(_ containerData: Data) -> Data? {
+        let signature = Data("bplist00".utf8)
+        guard let archiveRange = containerData.range(of: signature) else { return nil }
+        let archiveData = containerData.subdata(in: archiveRange.lowerBound..<containerData.endIndex)
+
+        do {
+            let unarchiver = try NSKeyedUnarchiver(forReadingFrom: archiveData)
+            unarchiver.requiresSecureCoding = false
+            unarchiver.setClass(AirCardArchivedPKImage.self, forClassName: "PKImage")
+            unarchiver.setClass(AirCardArchivedFrontFaceImageSet.self, forClassName: "PKPassFrontFaceImageSet")
+            // Keep a second observed-style alias available for OS/card-family variation.
+            unarchiver.setClass(AirCardArchivedFrontFaceImageSet.self, forClassName: "PKPaymentPassFrontFaceImageSet")
+            defer { unarchiver.finishDecoding() }
+
+            guard let root = unarchiver.decodeObject(forKey: NSKeyedArchiveRootObjectKey)
+                    as? AirCardArchivedFrontFaceImageSet,
+                  let imageData = root.faceImage?.imageData,
+                  !imageData.isEmpty,
+                  ImageEngine.safeImageFromData(imageData, maxDimension: 4096) != nil else {
+                return nil
+            }
+            return imageData
+        } catch {
+            return nil
+        }
+    }
+
+    /// Best-effort capture of Wallet's final rendered face. Failure or absence is
+    /// non-fatal for immutable raw-artwork backup creation, but an unsafe move/write-back
+    /// failure stops further rendered-cache probing and leaves recovery data intact.
     nonisolated static func captureRenderedWalletReference(
         cardId: String,
         pairingPath: String
@@ -101,59 +171,85 @@ extension AppViewModel {
                 targetDirectory: cacheDirectory
             )
 
-            if read.sourceMissing {
-                continue
-            }
+            if read.sourceMissing { continue }
 
             if let error = read.error {
-                // A non-missing failure after a destructive export is treated as a
-                // safety event. The raw original-artwork backup may still continue,
-                // but do not probe additional cache entries in this transaction.
                 return .unsafe(error: error)
             }
 
-            guard let data = read.data else { continue }
+            guard let containerData = read.data else { continue }
 
-            // Keep a raw diagnostic copy even if the cache payload is not directly
-            // decodable as an image. This lets us inspect the container format later.
+            // Retain the raw cache envelope for diagnostics. It is never used as the
+            // restore source and never replaces the immutable Originals backup.
             persistRenderedWalletRawDiagnostic(
-                data: data,
+                data: containerData,
                 cardId: cleanId,
                 cacheSuffix: candidate.suffix,
                 leaf: candidate.leaf
             )
 
-            guard let image = ImageEngine.safeImageFromData(data, maxDimension: 2048),
-                  let normalized = ImageEngine.normalizeAndDownsample(image, maxDimension: 2048).pngData() else {
-                lastDetail = "\(candidate.suffix)/\(candidate.leaf) existed (\(data.count) bytes) but was not directly decodable as an image"
+            guard let faceImageData = decodeRenderedWalletFrontFaceImageData(containerData),
+                  let image = ImageEngine.safeImageFromData(faceImageData, maxDimension: 4096) else {
+                lastDetail = "\(candidate.suffix)/\(candidate.leaf) existed (\(containerData.count) bytes) but contained no decodable FrontFace.faceImage"
+                continue
+            }
+
+            // Preserve faceImage bytes as-is whenever Wallet stored PNG. If Apple ever
+            // changes PKImage.imageData to another decodable format, normalize only that
+            // future format to PNG so the on-disk reference path remains stable.
+            let pngSignature = Data([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+            let persistedData: Data
+            let extractionPath: String
+            if faceImageData.starts(with: pngSignature) {
+                persistedData = faceImageData
+                extractionPath = "NSKeyedArchive.faceImage.imageData"
+            } else if let pngData = image.pngData() {
+                persistedData = pngData
+                extractionPath = "NSKeyedArchive.faceImage.imageData→PNG"
+            } else {
+                lastDetail = "\(candidate.suffix)/\(candidate.leaf) faceImage was decodable but could not be persisted"
+                continue
+            }
+
+            guard let persistedImage = ImageEngine.safeImageFromData(persistedData, maxDimension: 4096) else {
+                lastDetail = "Extracted FrontFace.faceImage failed post-extraction validation"
+                continue
+            }
+
+            let width = persistedImage.cgImage?.width ?? Int(persistedImage.size.width * persistedImage.scale)
+            let height = persistedImage.cgImage?.height ?? Int(persistedImage.size.height * persistedImage.scale)
+            guard width > 0, height > 0 else {
+                lastDetail = "Extracted FrontFace.faceImage had invalid dimensions"
                 continue
             }
 
             let directory = renderedWalletReferenceDirectory(for: cleanId)
             let imageURL = renderedWalletReferenceImagePath(for: cleanId)
             let manifestURL = renderedWalletReferenceManifestPath(for: cleanId)
-            let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
             let manifest = WalletRenderedReferenceManifest(
-                version: 1,
+                version: 2,
                 cardId: cleanId,
                 capturedAt: Date(),
                 cacheSuffix: candidate.suffix,
                 leaf: candidate.leaf,
-                byteCount: data.count,
-                sha256: digest,
-                pixelWidth: Int(image.size.width * image.scale),
-                pixelHeight: Int(image.size.height * image.scale)
+                byteCount: persistedData.count,
+                sha256: renderedReferenceSHA256(persistedData),
+                pixelWidth: width,
+                pixelHeight: height,
+                extractionPath: extractionPath,
+                containerByteCount: containerData.count,
+                containerSha256: renderedReferenceSHA256(containerData)
             )
 
             do {
                 try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-                try normalized.write(to: imageURL, options: .atomic)
+                try persistedData.write(to: imageURL, options: .atomic)
                 let encoder = JSONEncoder()
                 encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
                 try encoder.encode(manifest).write(to: manifestURL, options: .atomic)
                 return .captured(manifest)
             } catch {
-                return .unsafe(error: "Rendered Wallet reference was decoded but could not be persisted: \(error.localizedDescription)")
+                return .unsafe(error: "FrontFace.faceImage was decoded but could not be persisted: \(error.localizedDescription)")
             }
         }
 
@@ -210,7 +306,6 @@ extension AppViewModel {
             try FileManager.default.createDirectory(at: recoveryRoot, withIntermediateDirectories: true)
             try FileManager.default.copyItem(at: exportedURL, to: recoveryFile)
         } catch {
-            // If persistent recovery creation fails, immediately restore from staging.
             let emergency = await writeWalletDirectory(
                 pairingPath: pairingPath,
                 sourceDirectory: stageDirectory,
@@ -294,6 +389,10 @@ extension AppViewModel {
         } catch {
             // Diagnostic persistence must never change scan/backup safety semantics.
         }
+    }
+
+    nonisolated private static func renderedReferenceSHA256(_ data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
     nonisolated private static func exportRenderedWalletCacheFile(
