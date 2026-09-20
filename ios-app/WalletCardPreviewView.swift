@@ -27,7 +27,9 @@ struct WalletCardPreviewView: View {
 
     var body: some View {
         let customImage = card.uiImage
-        let walletPreview = AppViewModel.scannedCardPreviewImage(for: card.id)
+        let renderedWalletPreview = AppViewModel.renderedWalletReferenceImage(for: card.id)
+        let rawWalletPreview = AppViewModel.scannedCardPreviewImage(for: card.id)
+        let walletPreview = renderedWalletPreview ?? rawWalletPreview
         let displayImage = customImage ?? walletPreview
         let logo = AppViewModel.scannedCardLogoImage(for: card.id)
         let metadata = AppViewModel.scannedCardMetadata(for: card.id)
