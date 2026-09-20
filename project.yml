@@ -15,7 +15,6 @@ settings:
     # AirliftFFI is arm64-only (aws-lc-rs / idevice); drop x86_64 simulator slice.
     EXCLUDED_ARCHS[sdk=iphonesimulator*]: x86_64
     CODE_SIGN_STYLE: Automatic
-    DEVELOPMENT_TEAM: ""
 
 targets:
   AirCard-iOS:
