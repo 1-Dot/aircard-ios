@@ -54,12 +54,14 @@ struct WalletScanBackupRootView: View {
 }
 
 extension AppViewModel {
-    /// Creates the authoritative immutable backup after the first completed preview
-    /// attempt. Preview success is optional: if no displayable preview is available,
-    /// AirCard still preserves the raw artwork as long as no scan recovery is pending.
-    /// `ensureOriginalArtworkBackup` is move-based, so when it creates a new backup this
-    /// method writes the exact raw files straight back to Wallet before declaring the
-    /// scan complete.
+    /// Captures a best-effort Wallet-rendered reference and then creates/verifies the
+    /// authoritative immutable raw-artwork backup. The two stores have different jobs:
+    ///
+    /// - RenderedReferences = what Wallet appears to render, when a decodable cache
+    ///   entry is available. This is display/reproduction evidence only.
+    /// - Originals = exact provider files used by Restore Original.
+    ///
+    /// Failure or absence of a rendered reference never prevents the raw backup.
     func preserveFirstDetectedArtworkAfterScan(for cardId: String) {
         let cleanId = CardItem.cleanCardId(cardId) ?? cardId
 
@@ -68,25 +70,78 @@ extension AppViewModel {
             return
         }
 
-        let existing = Self.validateOriginalArtworkBackup(for: cleanId)
-        if existing.isValid {
-            WalletCardOperationStore.shared.set(.ready("Artwork + original backup verified ✅"), for: cleanId)
-            scanStatusText = "Found card: \(cleanId.prefix(12))… Original backup verified ✅"
-            objectWillChange.send()
-            return
-        }
-
-        if case .invalid(let reason) = existing {
-            WalletCardOperationStore.shared.set(.failed("Existing backup needs recovery"), for: cleanId)
-            log.append("❌ Cannot create scan backup for \(cleanId.prefix(12)): \(reason)")
-            return
-        }
-
         let pairingPath = PairingController.pairingFilePath()
-        WalletCardOperationStore.shared.set(.backingUp("Preserving first-detected artwork…"), for: cleanId)
-        scanStatusText = "Found card: \(cleanId.prefix(12))… Saving original artwork…"
+        WalletCardOperationStore.shared.set(.backingUp("Checking Wallet-rendered face…"), for: cleanId)
+        scanStatusText = "Found card: \(cleanId.prefix(12))… Checking rendered Wallet face…"
 
         Task.detached(priority: .userInitiated) { [weak self] in
+            let rendered = await Self.captureRenderedWalletReference(
+                cardId: cleanId,
+                pairingPath: pairingPath
+            )
+
+            await MainActor.run {
+                guard let self else { return }
+                switch rendered {
+                case .captured(let manifest):
+                    self.log.append(
+                        "🎨 Wallet-rendered reference captured for \(cleanId.prefix(12))… " +
+                        "from \(manifest.cacheSuffix)/\(manifest.leaf) " +
+                        "(\(manifest.pixelWidth)×\(manifest.pixelHeight), \(manifest.byteCount) bytes)"
+                    )
+                    WalletCardOperationStore.shared.set(
+                        .backingUp("Rendered face captured · preserving original…"),
+                        for: cleanId
+                    )
+                case .unavailable(let attempted, let detail):
+                    var line = "ℹ️ No directly decodable Wallet-rendered reference found for \(cleanId.prefix(12))… after \(attempted) cache candidates"
+                    if let detail { line += ": \(detail)" }
+                    self.log.append(line)
+                    WalletCardOperationStore.shared.set(
+                        .backingUp("Rendered face unavailable · preserving original…"),
+                        for: cleanId
+                    )
+                case .unsafe(let error):
+                    self.log.append(
+                        "⚠️ Wallet-rendered reference probe stopped: \(error). " +
+                        "Immutable raw backup will continue."
+                    )
+                    WalletCardOperationStore.shared.set(
+                        .backingUp("Rendered probe stopped · preserving original…"),
+                        for: cleanId
+                    )
+                }
+                self.objectWillChange.send()
+            }
+
+            // The rendered-reference probe is deliberately non-authoritative. Always
+            // continue into raw backup validation/creation regardless of its result.
+            let existing = Self.validateOriginalArtworkBackup(for: cleanId)
+            if existing.isValid {
+                await MainActor.run {
+                    guard let self else { return }
+                    WalletCardOperationStore.shared.set(.ready("Artwork + original backup verified ✅"), for: cleanId)
+                    self.scanStatusText = "Found card: \(cleanId.prefix(12))… Original backup verified ✅"
+                    self.objectWillChange.send()
+                }
+                return
+            }
+
+            if case .invalid(let reason) = existing {
+                await MainActor.run {
+                    guard let self else { return }
+                    WalletCardOperationStore.shared.set(.failed("Existing backup needs recovery"), for: cleanId)
+                    self.log.append("❌ Cannot create scan backup for \(cleanId.prefix(12)): \(reason)")
+                }
+                return
+            }
+
+            await MainActor.run {
+                guard let self else { return }
+                WalletCardOperationStore.shared.set(.backingUp("Preserving first-detected artwork…"), for: cleanId)
+                self.scanStatusText = "Found card: \(cleanId.prefix(12))… Saving original artwork…"
+            }
+
             let preparation = await Self.ensureOriginalArtworkBackup(
                 cardId: cleanId,
                 pairingPath: pairingPath,
