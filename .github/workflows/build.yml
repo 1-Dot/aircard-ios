@@ -13,6 +13,9 @@ jobs:
         with:
           lfs: true
 
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
       - name: Build IPA
         run: |
           chmod +x build-ipa.sh
